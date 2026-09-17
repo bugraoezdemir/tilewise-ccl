@@ -598,35 +598,64 @@ def _relabel_block(block, luts, struct, connectivity, labeler, block_info=None):
     return luts[tile_idx][local]
 
 
+def _region_source(mask, tcs, tce, block, starts, stops):
+    """The tile's WHOLE core as a mask array.
+
+    When the pulled region covers the core entirely we slice it out of `block` (free).
+    Otherwise the block is missing part of the core, and the local ids can only be
+    reproduced from the full extent - so we pull those voxels from the mask itself.
+    """
+    ndim = len(tcs)
+    if all(tcs[a] >= starts[a] and tce[a] <= stops[a] for a in range(ndim)):
+        bsl = tuple(slice(tcs[a] - starts[a], tce[a] - starts[a]) for a in range(ndim))
+        return block[bsl]
+    sl = tuple(slice(tcs[a], tce[a]) for a in range(ndim))
+    core = mask[sl]
+    core = getattr(core, "compute", lambda: core)()
+    return np.asarray(core)
+
+
 def _relabel_region(block, location, luts, tile_shape, shape, struct, connectivity, labeler,
-                    out_dtype):
-    """dyna Phase B: a pulled REGION may span several whole tiles (align=tile_shape), so
-    decompose it into tiles and relabel each tile's own core (reproducing Phase A's local
-    ids exactly), applying that tile's LUT. No halo - see the module docstring."""
+                    out_dtype, mask=None):
+    """dyna Phase B: relabel a pulled REGION by decomposing it into the tiles it overlaps.
+
+    Phase A's local ids are reproduced by re-running the per-tile labeling, and
+    `scipy.ndimage.label` numbers components in raster order over whatever extent it is
+    given - so the labeling MUST cover a tile's whole core, or the ids no longer index
+    that tile's LUT. The region itself need not be tile-aligned: for each overlapped tile
+    we label the full core, apply the LUT, and copy back only the part the region asked
+    for. Labeling cost is per whole tile either way; only the copy is clipped.
+    """
     ndim = len(shape)
     starts = [lo for lo, _ in location]
     stops = [hi for _, hi in location]
-    # This func can only reproduce Phase A's local ids if it is handed WHOLE tiles - it
-    # re-runs the per-tile labeling to rebuild them. A partial tile relabels a different
-    # region, so the local ids no longer index that tile's LUT: previously that surfaced as
-    # a bare IndexError from the LUT lookup, or (worse) silently wrong labels. The pull side
-    # guarantees this via map_overlap(align=tile_shape); assert it rather than trust it.
-    for a in range(ndim):
-        if starts[a] % tile_shape[a] or (stops[a] % tile_shape[a] and stops[a] != shape[a]):
-            raise ValueError(
-                f"tilewise-ccl Phase B needs whole tiles, got region {tuple(location)} "
-                f"against tile_shape {tuple(tile_shape)} on axis {a}. This means the read "
-                f"was not aligned to the tile grid (map_overlap align=)."
-            )
     out = np.zeros(block.shape, dtype=out_dtype)
     tlo = [starts[a] // tile_shape[a] for a in range(ndim)]
     thi = [(stops[a] - 1) // tile_shape[a] for a in range(ndim)]
     for tidx in itertools.product(*[range(tlo[a], thi[a] + 1) for a in range(ndim)]):
+        # the tile's core in GLOBAL coords
         tcs = [tidx[a] * tile_shape[a] for a in range(ndim)]
         tce = [min((tidx[a] + 1) * tile_shape[a], shape[a]) for a in range(ndim)]
-        bsl = tuple(slice(tcs[a] - starts[a], tce[a] - starts[a]) for a in range(ndim))
-        local, _ = _label_block(block[bsl] > 0, struct, connectivity, labeler)
-        out[bsl] = luts[tidx][local]
+        # the part of that core this region actually covers, in GLOBAL coords
+        ics = [max(tcs[a], starts[a]) for a in range(ndim)]
+        ice = [min(tce[a], stops[a]) for a in range(ndim)]
+        if any(ics[a] >= ice[a] for a in range(ndim)):
+            continue
+        if all(tcs[a] >= starts[a] and tce[a] <= stops[a] for a in range(ndim)):
+            # whole core is inside the region: label it in place, no extra read
+            bsl = tuple(slice(tcs[a] - starts[a], tce[a] - starts[a]) for a in range(ndim))
+            local, _ = _label_block(block[bsl] > 0, struct, connectivity, labeler)
+            out[bsl] = luts[tidx][local]
+            continue
+        # PARTIAL overlap: the block does not hold the tile's whole core, so we cannot
+        # reproduce its local ids from `block` alone. `_region_source` pulls the missing
+        # core from the mask; labeling still covers exactly the tile, so ids stay valid.
+        core = _region_source(mask, tcs, tce, block, starts, stops)
+        local, _ = _label_block(core > 0, struct, connectivity, labeler)
+        relabeled = luts[tidx][local]
+        src = tuple(slice(ics[a] - tcs[a], ice[a] - tcs[a]) for a in range(ndim))
+        dst = tuple(slice(ics[a] - starts[a], ice[a] - starts[a]) for a in range(ndim))
+        out[dst] = relabeled[src]
     return out
 
 
@@ -719,27 +748,33 @@ def label_array(
         restating it.
     executor : {"thread", "process"}
         Pool type for Phase A (ignored when `n_workers <= 1`). `"process"` sidesteps the GIL;
-        whether that helps depends ENTIRELY on `backend`, because the two differ in how much
-        GIL-bound Python work each tile read costs. Measured end to end on 1024^3 uint8 /
-        256^3 tiles / 64^3 chunks / 8 workers (best of 2). BOTH backends write the same
-        zarr v3 array with the same blosc/zstd-5/bitshuffle codec and produce byte-identical
-        output (82.6 MiB on disk in every row); Phase B is timed by that write:
+        whether that helps depends on `backend` and, above all, on HOW FINELY THE INPUT IS
+        CHUNKED, since that sets how much GIL-bound Python work a tile read costs. Measured
+        end to end on 1024^3 uint8 (17,086 mixed-scale objects) / 96^3 input chunks /
+        384^3 tiles / 96^3 output chunks / 4 workers (best of 3). BOTH backends write the
+        same zarr v3 array with the same blosc/zstd-5/bitshuffle codec and produce
+        byte-identical output (3.0 MiB on disk in every row); Phase B is timed by that write:
 
             backend/executor   phase A   phase B    total
-            dask / thread        7.0 s    12.8 s   19.7 s
-            dask / process       5.1 s    12.7 s   17.8 s
-            dyna / thread        2.8 s     8.2 s   11.0 s   <- fastest
-            dyna / process       4.4 s     8.1 s   12.5 s
+            dask / thread        2.7 s     8.0 s   10.7 s
+            dask / process       3.4 s     8.1 s   11.5 s
+            dyna / thread        1.5 s     6.6 s    8.1 s   <- fastest
+            dyna / process       2.9 s     6.7 s    9.6 s
 
-        - `backend="dask"`: the read goes through dask's graph + zarr's Python-level chunk
-          assembly, which is GIL-bound, so `"process"` wins Phase A (1.4x).
-        - `backend="dyna"`: dyna pulls each tile directly (no dask graph), so there is little
-          GIL contention left and the per-tile result pickling costs more than it saves -
-          `"thread"` is FASTER (1.6x). Keep the default here.
+        - At this chunk size `"thread"` wins for BOTH backends: the pool start-up costs
+          ~0.7-1.4 s of Phase A and is not earned back. Keep the default.
+        - `backend="dyna"` leads in every cell; dyna/thread is 1.3x dask/thread overall.
 
-        NOTE Phase B is 65-75% of the run and `executor` does not affect it, so the BACKEND
-        choice dominates: dyna/thread is 1.8x dask/thread overall, while swapping executor
-        moves the total by ~10%.
+        THE GAP SCALES WITH INPUT CHUNK SIZE. Rewriting the same volume in 32^3 chunks
+        (32,768 source chunks; 1,728 chunk reads per 384^3 tile instead of 64) slows the
+        dask path far more than dyna's direct region pulls: Phase A goes 2.7 s -> 28.9 s
+        for dask/thread but only ~1.5 s -> 3.0 s for dyna/thread, and the overall margin
+        grows from 1.3x to ~3.5x. That is the one regime where `executor="process"` clearly
+        pays off for dask (Phase A 28.9 s -> 12.3 s). With coarser 128^3 chunks the margin
+        narrows to ~1.2x instead.
+
+        NOTE Phase B is 75-80% of the run and `executor` barely affects it, so the BACKEND
+        choice dominates.
         The mask is shipped to each worker ONCE via the pool initializer, and lazy masks
         (zarr / dask / dyna `DynamicArray`) pickle as ~2 KiB references, so no array data is
         copied. Falls back to threads automatically for an in-memory `np.ndarray` mask (which
@@ -1029,7 +1064,7 @@ def label_array(
         _apply_region = partial(_relabel_region, luts=full_luts,
                                 tile_shape=tuple(int(t) for t in tile_shape), shape=shape,
                                 struct=struct, connectivity=connectivity, labeler=labeler,
-                                out_dtype=out_dtype)
+                                out_dtype=out_dtype, mask=mask)
 
         from dyna_zarr import operations as _dops
         # align=tile_shape: every pulled region is expanded to WHOLE tiles, so Phase B is

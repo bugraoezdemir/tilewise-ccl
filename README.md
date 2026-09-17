@@ -7,16 +7,17 @@ returning a lazy array of labels.
 backed) and returns a **lazy dask array** of connected-component labels, computed
 with a tile-local labeling pass plus a small global boundary-piece graph. It is:
 
-- **Fast**: only the pieces that touch a tile border are reconciled, on a small graph, so the
-  cost stays low even as the number of tiles grows.
+- **Fast**: only components that touch a tile border are reconciled, through a small global graph, so the reconciliation cost stays small as the number of tiles grows.
 - **N-dimensional**: 2D, 3D, or higher; connectivity is configurable.
 - **Storage- and domain-agnostic**: no OME-Zarr / image-format dependency; just
   NumPy + SciPy + Dask.
 - **Dask-optional**: the `dyna` backend (see [Backends](#backends)) runs the whole
   thing through [dyna-zarr](https://github.com/bugraoezdemir/dyna_zarr)'s pull model
-  instead - no task graph, and it fuses a preceding threshold into each tile read.
-- **Memory-bounded**: peak memory scales with `(tile size) × (concurrency)`, not
-  with the array size, so it labels arrays far larger than RAM.
+  instead - no Dask task graph, and it fuses a preceding threshold into each tile read.
+- **Memory-bounded**: peak working memory is primarily controlled by tile size and
+  concurrency rather than the total array size, so it labels arrays far larger than
+  RAM. (On the dask backend the output chunking matters too - see
+  [Choosing `tile_shape`](#choosing-tile_shape).)
 - **Composable**: the result is a genuine lazy dask array, so it plugs straight
   into other dask operations, such as `da.unique`, slicing, arithmetic, `.to_zarr(...)`, region-property
   computation, etc.
@@ -86,7 +87,7 @@ from tilewise_ccl import label_array
 arr = da.from_zarr("dataset.zarr/0")     # e.g. a huge 3D volume, uint8/uint16
 mask = arr > 128                          # lazy boolean mask
 
-labels = label_array(mask, tile_shape=(384, 384, 384), connectivity=2, n_workers=8)
+labels = label_array(mask, tile_shape=(384, 384, 384), connectivity=2, n_workers=4)
 
 # the result is lazy. Stream it straight to disk (each chunk written once)
 labels.to_zarr("labels.zarr", overwrite=True)
@@ -95,7 +96,7 @@ labels.to_zarr("labels.zarr", overwrite=True)
 ### The same, without dask (the `dyna` backend)
 
 The identical job through [dyna-zarr](https://github.com/bugraoezdemir/dyna_zarr)'s
-pull model - no task graph anywhere. Install the `[dyna]` extra. Labels are
+pull model - no Dask task graph anywhere. Install the `[dyna]` extra. Labels are
 byte-identical to the dask path; only the execution differs. See
 [Backends](#backends) for what changes and why.
 
@@ -108,7 +109,7 @@ arr = dio.read("dataset.zarr/0")          # a DynamicArray, not a dask array
 mask = arr > 128                          # lazy - and FUSED into each tile read
 
 # backend is inferred from the mask type - a DynamicArray selects the dyna path
-labels = label_array(mask, tile_shape=(384, 384, 384), connectivity=2, n_workers=8)
+labels = label_array(mask, tile_shape=(384, 384, 384), connectivity=2, n_workers=4)
 
 # the result is a lazy DynamicArray - write it with dyna-zarr's writer, which
 # picks up the tile grid automatically (see the note below).
@@ -131,14 +132,14 @@ Two differences worth noting against the dask version above:
 
 The labeling is lazy, and so is everything you build on it. A useful consequence:
 `properties=True` gives you every object's size and bounding box as **metadata**,
-without a pass over the data - so you can find an object of interest and then
-read back only the box it occupies.
+without a second pass over the data - it reuses the tiles Phase A already read, so
+you can find an object of interest and then read back only the box it occupies.
 
 ```python
 import numpy as np
 
 labels, diag = label_array(mask, tile_shape=(128, 128, 128), connectivity=2,
-                           n_workers=8, properties=True)
+                           n_workers=4, properties=True)
 
 # area / bbox come from the per-tile pass - no extra read of the array
 i    = int(np.argmax(diag["area"]))          # the largest object
@@ -150,7 +151,7 @@ crop = labels[tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))].compute()
 obj  = crop == lbl                            # the object itself, isolated
 ```
 
-Only the box is ever materialized. The rest of the array is never touched.
+Only the box is materialized during Phase B; the rest of the labeled output is never computed.
 
 The same laziness applies to ordinary array work:
 
@@ -160,9 +161,9 @@ import dask.array as da
 # count objects an independent way (excludes background 0)
 n_objects = int(np.count_nonzero(da.unique(labels).compute()))
 
-# match the storage chunking before writing (cheap when tile_shape is a
-# multiple of the target chunk, e.g. 384 = 4 * 96)
-labels.rechunk((96, 96, 96)).to_zarr("labels.zarr", overwrite=True)
+# write at the tile shape: Phase B emits one block per tile, so this needs no
+# split on the way out (see "Choosing tile_shape" for why smaller chunks cost more)
+labels.to_zarr("labels.zarr", overwrite=True)
 ```
 
 ---
@@ -198,7 +199,7 @@ labels, diag = label_array(mask, diagnostics=True)  # -> (dask.array.Array, dict
 | `diagnostics` | bool | `False` | If `True`, also return a `diag` dict (the function returns a `(labels, diag)` tuple instead of just `labels`). |
 | `properties` | bool | `False` | Also compute per-object `area` (voxel count) and `bbox_start`/`bbox_stop` (half-open global bounding box) into `diag` - implies returning the tuple. Aggregated from per-tile partials, so memory stays bounded by tile size no matter how large an object is. |
 | `backend` | `"auto"` \| `"dask"` \| `"dyna"` | `"auto"` | Execution backend. `"auto"` infers it from the mask type - a `DynamicArray` gets the dyna path, anything else gets dask - so you rarely pass this. See [Backends](#backends). |
-| `executor` | `"thread"` \| `"process"` | `"thread"` | Pool type for Phase A. Which one wins depends entirely on `backend` - see [Backends](#backends). |
+| `executor` | `"thread"` \| `"process"` | `"thread"` | Pool type for Phase A. `"thread"` is the right default at moderate input chunk sizes; `"process"` only pays off when the input is finely chunked and the per-tile read is GIL-bound - see [Backends](#backends). |
 | `labeler` | `"scipy"` \| `"cc3d"` | `"scipy"` | Per-tile CCL kernel. `"cc3d"` (needs the `[cc3d]` extra, 3-D only) is ~2x faster per call but **holds the GIL**, so it only pays off with `executor="process"`. Both emit identical labels. |
 | `verbose` | bool | `False` | Print per-tile progress for Phase A (immediately) and Phase B (when the returned array is computed/written). |
 
@@ -253,20 +254,31 @@ result. Guidance:
   storage chunks, so the tile is always a chunk multiple and no chunk is read
   twice. On a 3-D array chunked at `96³` that lands on `384³`; on a 5-D
   `(t, c, z, y, x)` it tiles `z/y/x` only and leaves `t`/`c` at 1.
-- Override it when you have memory to spare. Peak RSS is roughly **2x the tile's
-  int32 size, per worker** (measured), so a `512³` tile costs ~1 GiB per worker -
-  8 GiB at `n_workers=8`. Bigger tiles mean fewer boundary pieces and a smaller
-  reconciliation graph, at that cost.
+- Override it when you have memory to spare. Phase A holds a few tiles at once, so
+  its cost scales with `n_workers × (tile voxels)`: at 128³ tiles and 4 workers that
+  measured ~350 MiB, and at 256³ tiles ~1 GiB. Bigger tiles mean fewer boundary
+  pieces and a smaller reconciliation graph, at that cost.
 - It is **decoupled from storage chunking**: `label_array` reads whatever tile
   size you ask for directly, regardless of how the data is chunked on disk, so
   there is no need to `rechunk` the input first. This keeps it efficient even on
   natively small-chunked data.
-- If you write the result with `.to_zarr`, keep the output chunk shape a divisor
-  of `tile_shape` (e.g. tile `384`, chunks `96`) so the pre-write `rechunk` is a
-  cheap sub-slice rather than a cross-block shuffle.
+- **On the dask backend, keep the output chunk equal to `tile_shape`.** Phase B
+  emits one block per tile, so writing to a smaller chunk makes dask split every
+  block on the way out, and that split - not the labeling - dominates peak memory
+  (128³ tiles, 4 workers):
 
-Peak memory is roughly `n_workers × (tile voxels) × (a few bytes)`. Set
-`tile_shape` and `n_workers` to fit your memory budget.
+  | input | `chunks == tile` | `chunks = tile/2` |
+  |---|---|---|
+  | 1 GiB | 563 MiB | 965 MiB |
+  | 8 GiB | 728 MiB | 1780 MiB |
+  | 15.6 GiB | 1066 MiB | 2662 MiB |
+
+  Labeling with large tiles and then writing to small chunks is the combination to
+  avoid. If you need small storage chunks, use the `dyna` backend, which writes
+  them directly.
+
+Phase A's memory is `n_workers × (tile voxels) × (a few bytes)` - ~300-400 MiB on
+every volume above. The write is what varies; see the table.
 
 ---
 
@@ -379,46 +391,69 @@ graph anywhere**. Two things make this fast:
 The returned array is a lazy `DynamicArray`, so write it with dyna-zarr's writer
 rather than `.to_zarr()` - see the [worked example above](#the-same-without-dask-the-dyna-backend).
 
+- **It writes the chunks you ask for, directly.** There is no block-splitting step,
+  so fine output chunks cost nothing extra in memory - the case where the dask path
+  is most expensive. On a 15.6 GiB volume with 128³ tiles and 64³ output chunks,
+  dyna peaked at 990 MiB against dask's 2662 MiB, and its Phase A was ~7x faster
+  (29 s vs 225 s). If you need small storage chunks on large data, this is the
+  backend to use.
+
 Any `DynamicArray` works as the mask - however you obtained it, and with any
 chain of lazy dyna operations already applied.
 
-### Picking `executor`
+### Picking a backend
 
-`executor` only affects Phase A, and the right answer depends on the backend,
-because the two differ in how much GIL-bound Python work a tile read costs.
+Measured on a 1024³ uint8 volume (1 GiB) of mixed-scale objects - 17,086 components from
+~20-voxel specks up to a 386×589×311 structure crossing four tiles - stored in 64³ chunks
+and written back to 64³ chunks, 4 workers. Each backend runs at the tile size that suits
+it: dask writes at its tile shape (no block splitting), dyna writes the requested chunks
+directly. **Both produce byte-identical labels** (17,086 objects, 2.5 MiB on disk):
 
-Measured end to end on a 1024³ uint8 volume (1 GiB), 256³ tiles, 64³ output
-chunks, 8 workers, best of 2. **Both backends write the same zarr v3 array with
-the same blosc/zstd-5/bitshuffle codec** and produce byte-identical output
-(82.6 MiB on disk in every row). Phase B is the lazy half, timed by writing:
+| backend | tile | Phase A | Phase B (write) | total | peak RSS |
+|---|---|---|---|---|---|
+| `dask` | 64³ | 21.9 s | 16.1 s | 38.0 s | 651 MiB |
+| `dyna` | 128³ | **2.4 s** | **9.8 s** | **12.2 s** | **345 MiB** |
 
-| backend / executor | Phase A | Phase B (write) | total |
+`dyna` is ~3x faster end to end on about half the memory, and the margin is widest in
+Phase A (~9x here): dask assembles each tile from many small chunk reads through its task
+graph, which is GIL-bound, while dyna pulls the region directly. **The finer the input
+chunking, the bigger the gap** - with coarse 128³ input chunks it narrows to ~1.2x, and
+with small 32³ chunks it grows to ~3.5x.
+
+Peak memory follows the tile: dyna at 256³ tiles peaks near 1 GiB, at 128³ near 350 MiB.
+Set `tile_shape` to the memory you can afford.
+
+### What a crop actually costs
+
+Phase A runs once over the whole volume; after that the labels are lazy, so the write cost
+tracks the region you ask for. Same volume as above, writing each target on its own:
+
+| target | % of volume | `dask` write (tile 64³) | `dyna` write (tile 128³) |
 |---|---|---|---|
-| `dask` / `thread` | 7.0 s | 12.8 s | 19.7 s |
-| `dask` / `process` | **5.1 s** | 12.7 s | 17.8 s |
-| `dyna` / `thread` | **2.8 s** | **8.2 s** | **11.0 s** |
-| `dyna` / `process` | 4.4 s | 8.1 s | 12.5 s |
+| full volume | 100% | 16.20 s | 9.71 s |
+| one half | 50% | 8.16 s | 5.15 s |
+| one octant | 12.5% | 2.13 s | 1.41 s |
+| largest object's bbox | 0.035% | 0.08 s | 0.39 s |
+| a median-sized object | 0.000006% | 0.02 s | 0.10 s |
 
-Reading it:
+Peak RSS stays flat down each column - ~630-650 MiB for dask, ~360-400 MiB for dyna -
+because it is set by `tile_shape × n_workers`, not by how much you write.
 
-- **Phase B dominates** - roughly 65-75% of the run. It is mostly I/O and
-  compression, and `executor` does not touch it.
-- Within Phase A the rule holds: `process` helps `dask` (1.4x, its read goes
-  through dask's graph and zarr's Python-level chunk assembly, which is
-  GIL-bound), while `thread` wins for `dyna` (1.6x, it pulls tiles directly, so
-  little GIL contention remains and per-tile pickling costs more than it saves).
-- **The backend matters more than the executor.** `dyna`/`thread` is **1.8x** the
-  `dask`/`thread` baseline overall, while switching executor moves the total by
-  ~10%. Choose the backend first.
+Note the crossover at the bottom: dask's 64³ tiles make sub-tile crops cheaper than dyna's
+128³ ones, since a crop smaller than a tile still labels whole tiles. That is a `tile_shape`
+effect, not a backend one - drop dyna to 64³ tiles and it matches. The trade is worth it in
+the other direction: the larger tile is what makes dyna's Phase A ~9x faster.
 
-One machine's numbers; the direction generalizes, the ratios may not.
+One machine's numbers: the qualitative behaviour should generalize, but the absolute
+timings and ratios depend on hardware, chunking, tile size and workload.
 
-The mask is shipped to each worker **once** via the pool initializer, and lazy
-masks (zarr / dask / dyna) pickle as small references, so no array data is copied.
-Process pools fall back to threads automatically for an in-memory NumPy mask
-(which *would* be copied per worker) and for grids too small to amortize start-up.
+The mask is shipped to each worker **once** via the pool initializer, and lazy masks
+(zarr / dask / dyna) pickle as small references, so no array data is copied. Process
+pools fall back to threads automatically for an in-memory NumPy mask (which *would* be
+copied per worker) and for grids too small to amortize start-up.
 
-`labeler="cc3d"` follows the same logic: it is faster per call but holds the GIL,
-so pair it with `executor="process"` or not at all.
+`labeler="cc3d"` follows the same logic: it is faster per call but holds the GIL, so pair
+it with `executor="process"` or not at all.
+
 
 ---

@@ -7,7 +7,7 @@ storage- and domain-agnostic (no OME-Zarr dependency) and composes with
 downstream dask operations.
 """
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 __author__ = "Bugra Oezdemir"
 
 from tilewise_ccl.core import label_array

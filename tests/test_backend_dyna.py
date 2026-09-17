@@ -212,3 +212,33 @@ def test_windowed_plane(tmp_path, blobs):
                          connectivity=2, n_workers=2)
     full = _materialize(labels)
     np.testing.assert_array_equal(_materialize(labels[32, 8:56, 8:56]), full[32, 8:56, 8:56])
+
+
+@pytest.mark.parametrize("sl", [
+    (slice(None), slice(None), slice(None)),        # whole array through a SliceTransform
+    (slice(0, 32), slice(0, 32), slice(0, 32)),     # starts on the tile grid
+    (slice(16, 48), slice(16, 48), slice(16, 48)),  # chunk-aligned, tile-offset
+    (slice(5, 37), slice(9, 41), slice(3, 35)),     # arbitrary offset: PARTIAL tiles
+    (slice(20, 28), slice(20, 28), slice(20, 28)),  # smaller than one tile
+])
+def test_write_sliced_round_trip(tmp_path, blobs, sl):
+    """Writing a SLICE of the lazy result, not just the whole array.
+
+    A sliced region generally does not start on a tile border, so Phase B is handed
+    PARTIAL tiles. It must still reproduce each tile's local ids - it relabels the tile's
+    whole core and returns only the requested sub-box - or the LUT lookup silently yields
+    wrong labels. `test_write_round_trip` only covers the unsliced case.
+    """
+    path = _write(tmp_path, blobs, (16, 16, 16))
+    labels = label_array(io.read(path) > 128, tile_shape=(32, 32, 32),
+                         connectivity=2, n_workers=2)
+    expected = _materialize(labels[sl])
+
+    out = tmp_path / "sliced.zarr"
+    sub = labels[sl]
+    chunks = tuple(min(16, s) for s in sub.shape)
+    io.write(sub, str(out), chunks=chunks, max_workers=2, overwrite=True)
+    got = zarr.open_array(str(out), mode="r")[...]
+
+    assert got.shape == expected.shape
+    np.testing.assert_array_equal(got, expected)
