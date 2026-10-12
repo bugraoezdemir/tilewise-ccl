@@ -78,7 +78,7 @@ def test_default_labels_correctly():
     def part(a):
         return {frozenset(map(tuple, np.argwhere(a == v))) for v in np.unique(a) if v}
 
-    got = np.asarray(label_array(vol, connectivity=2, n_workers=2))
+    got = np.asarray(label_array(vol, connectivity=2, max_threads=2))
     assert part(got) == part(expected)
 
 

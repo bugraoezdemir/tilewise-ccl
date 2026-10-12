@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import itertools
 import time
+import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
@@ -47,12 +48,14 @@ import dask.array as da
 import numpy as np
 import scipy.ndimage as ndi
 
+from ._compat import renamed
+
 Tile = Tuple[int, ...]
 Piece = Tuple[Tile, int]
 
 #: scipy `generate_binary_structure` rank -> cc3d's 3-D connectivity number. cc3d is a
 #: dedicated C++ CCL library: ~2x faster than `ndi.label` per call but it HOLDS THE GIL, so
-#: it only pays off with `executor='process'` (with threads it is ~4x SLOWER overall, since
+#: it only pays off with `max_processes` (with threads it is ~1.5x SLOWER overall, since
 #: `ndi.label` releases the GIL and scales across the pool). Verified to produce byte-identical
 #: label ids to `ndi.label` for ranks 1/2/3, so the two are interchangeable between phases.
 _CC3D_CONN_3D = {1: 6, 2: 18, 3: 26}
@@ -100,8 +103,8 @@ class UnionFind:
 
 #: Target working-set size for an auto-chosen tile, in MiB (the labeled int32 core).
 #: MEASURED: real peak RSS is ~2x this per tile (mask + labels + scipy internals), and
-#: Phase A holds `n_workers` tiles at once - so 256 MiB is ~0.5 GiB per worker, ~4 GiB at
-#: n_workers=8. Large enough that most objects fall entirely inside one tile (which is what
+#: Phase A holds one tile per thread (or process) at once - so 256 MiB is ~0.5 GiB per
+#: thread, ~4 GiB at max_threads=8. Large enough that most objects fall entirely inside one tile (which is what
 #: keeps the boundary graph small), while still safe unattended on a 16 GB machine. Pass
 #: `tile_shape` explicitly to trade memory for fewer, larger tiles.
 _DEFAULT_TILE_MIB = 256
@@ -182,33 +185,6 @@ def iter_tiles(shape: Sequence[int], tile_shape: Sequence[int]):
     grid_shape = compute_grid_shape(shape, tile_shape)
     for tile_idx in itertools.product(*[range(n) for n in grid_shape]):
         yield tile_idx, tile_core_slice(tile_idx, shape, tile_shape)
-
-
-def expand_with_halo(
-    core_slice: Tuple[slice, ...], shape: Sequence[int], halo: int = 1
-) -> Tuple[Tuple[slice, ...], Tile, Tile]:
-    """Expand `core_slice` by `halo` voxels per side, clipped at array bounds.
-
-    Returns (haloed_slice, halo_lo, halo_hi) where halo_lo[axis]/halo_hi[axis] are
-    0 or `halo`, indicating whether the halo was actually added on that side
-    (it is omitted at the array's outer edges).
-    """
-    haloed_slices = []
-    halo_lo = []
-    halo_hi = []
-    for s, axis_size in zip(core_slice, shape):
-        lo = halo if s.start - halo >= 0 else 0
-        hi = halo if s.stop + halo <= axis_size else 0
-        haloed_slices.append(slice(s.start - lo, s.stop + hi))
-        halo_lo.append(lo)
-        halo_hi.append(hi)
-    return tuple(haloed_slices), tuple(halo_lo), tuple(halo_hi)
-
-
-def extract_face(core: np.ndarray, axis: int, side: str) -> np.ndarray:
-    idx: List = [slice(None)] * core.ndim
-    idx[axis] = 0 if side == "lo" else core.shape[axis] - 1
-    return core[tuple(idx)]
 
 
 def _read_block(arr, slices) -> np.ndarray:
@@ -702,13 +678,15 @@ def label_array(
     mask,
     tile_shape: Optional[Sequence[int]] = None,
     connectivity: int = 2,
-    n_workers: int = 1,
+    max_threads: Optional[int] = None,
     diagnostics: bool = False,
     properties: bool = False,
     verbose: bool = False,
     backend: str = "auto",
-    executor: str = "thread",
+    executor: Optional[str] = None,
     labeler: str = "scipy",
+    max_processes: Optional[int] = None,
+    n_workers: Optional[int] = None,
 ) -> Union[da.Array, Tuple[da.Array, dict]]:
     """Label connected components of a binary N-D mask into a lazy dask array.
 
@@ -731,10 +709,14 @@ def label_array(
         integer multiple of it when the chunking is known.
     connectivity : int
         Passed to `scipy.ndimage.generate_binary_structure(ndim, connectivity)`.
-    n_workers : int
-        If > 1, Phase A (metadata pass) runs via a thread pool. Phase B is a
-        lazy dask graph - its concurrency is controlled by dask's scheduler
-        when the caller computes/writes the result.
+    max_threads : int, optional
+        Phase A (the eager metadata pass) runs over the tiles in a pool of this many
+        threads; default 1 (no pool). Phase B is lazy: its threads are set by whoever
+        computes or writes the result (dask's scheduler, or
+        ``dyna_zarr.io.write(max_threads=)``).
+    max_processes : int, optional
+        Phase A in a pool of this many processes instead. Give ``max_threads`` or
+        ``max_processes``, not both. When processes pay off: see below.
     backend : {"auto", "dask", "dyna"}
         Read backend for the tile pulls. ``"auto"`` (default) picks ``"dyna"`` when
         ``mask`` is a ``dyna_zarr`` ``DynamicArray`` and ``"dask"`` otherwise - the mask
@@ -744,7 +726,7 @@ def label_array(
         ``"dyna"`` expects ``mask`` to be a ``dyna_zarr``
         ``DynamicArray`` (e.g. a lazy threshold like ``io.read(path) > 128``, with
         ``from dyna_zarr import io``):
-        Phase A pulls each haloed tile through dyna (memory-bounded, and it FUSES a
+        Phase A pulls each tile through dyna (memory-bounded, and it FUSES a
         preceding threshold into the tile read - no dask graph/scheduler overhead, ~3x
         faster per tile in practice), and Phase B is a NATIVE dyna ``map_overlap`` (no dask).
         The returned array is then a lazy ``dyna_zarr`` ``DynamicArray`` (``backend="dask"``
@@ -752,8 +734,12 @@ def label_array(
         carries ``tile_shape`` as its read alignment, and the writer adopts that as its
         region size, so each tile is read and labeled exactly once without the caller
         restating it.
-    executor : {"thread", "process"}
-        Pool type for Phase A (ignored when `n_workers <= 1`). `"process"` sidesteps the GIL;
+    executor : deprecated
+        Up to 0.0.6, ``n_workers=N`` set the pool size and ``executor`` its type:
+        ``executor="process"`` is now ``max_processes=N`` and ``"thread"`` is
+        ``max_threads=N``. The old form still works, with a FutureWarning.
+
+        Threads or processes for Phase A? Processes sidestep the GIL;
         whether that helps depends on `backend` and, above all, on HOW FINELY THE INPUT IS
         CHUNKED, since that sets how much GIL-bound Python work a tile read costs. Measured
         end to end on 1024^3 uint8 (17,086 mixed-scale objects) / 96^3 input chunks /
@@ -761,7 +747,7 @@ def label_array(
         same zarr v3 array with the same blosc/zstd-5/bitshuffle codec and produce
         byte-identical output (3.0 MiB on disk in every row); Phase B is timed by that write:
 
-            backend/executor   phase A   phase B    total
+            backend/pool       phase A   phase B    total
             dask / thread        2.7 s     8.0 s   10.7 s
             dask / process       3.4 s     8.1 s   11.5 s
             dyna / thread        1.5 s     6.6 s    8.1 s   <- fastest
@@ -775,11 +761,11 @@ def label_array(
         (32,768 source chunks; 1,728 chunk reads per 384^3 tile instead of 64) slows the
         dask path far more than dyna's direct region pulls: Phase A goes 2.7 s -> 28.9 s
         for dask/thread but only ~1.5 s -> 3.0 s for dyna/thread, and the overall margin
-        grows from 1.3x to ~3.5x. That is the one regime where `executor="process"` clearly
+        grows from 1.3x to ~3.5x. That is the one regime where `max_processes` clearly
         pays off for dask (Phase A 28.9 s -> 12.3 s). With coarser 128^3 chunks the margin
         narrows to ~1.2x instead.
 
-        NOTE Phase B is 75-80% of the run and `executor` barely affects it, so the BACKEND
+        NOTE Phase B is 75-80% of the run and the pool type barely affects it, so the BACKEND
         choice dominates.
         The mask is shipped to each worker ONCE via the pool initializer, and lazy masks
         (zarr / dask / dyna `DynamicArray`) pickle as ~2 KiB references, so no array data is
@@ -788,7 +774,7 @@ def label_array(
     labeler : {"scipy", "cc3d"}
         Per-tile connected-components kernel. `"scipy"` (default) is `ndi.label`. `"cc3d"`
         (needs `pip install connected-components-3d`, 3-D only) is ~2x faster per call but
-        HOLDS THE GIL, so it only pays off with `executor="process"` (with threads it is ~1.5x
+        HOLDS THE GIL, so it only pays off with `max_processes` (with threads it is ~1.5x
         SLOWER overall: 19.6s vs 13.1s). Both emit byte-identical label ids, so this never
         changes the result - it is purely a speed knob.
     diagnostics : bool
@@ -829,8 +815,22 @@ def label_array(
     # dask path for a DynamicArray mask (which works: dyna arrays expose __array__).
     if backend == "auto":
         backend = "dyna" if hasattr(mask, "_with_transform") else "dask"
-    if executor not in ("thread", "process"):
-        raise ValueError(f"executor must be 'thread' or 'process', got {executor!r}")
+    max_threads = renamed(max_threads, n_workers, new="max_threads", old="n_workers",
+                          where="label_array")
+    if executor is not None:
+        if executor not in ("thread", "process"):
+            raise ValueError(f"executor must be 'thread' or 'process', got {executor!r}")
+        if executor == "process" and max_processes is not None:
+            raise TypeError("label_array: executor='process' is the old form of "
+                            "max_processes=; pass max_processes= only")
+        warnings.warn("label_array: executor= is deprecated; pass max_processes=N for a "
+                      "process pool, max_threads=N for threads", FutureWarning, stacklevel=2)
+        if executor == "process":
+            max_processes, max_threads = max_threads, None
+    if max_threads is not None and max_processes is not None:
+        raise TypeError("label_array: Phase A runs in ONE pool; pass max_threads= or "
+                        "max_processes=, not both")
+    n_pool = int(max_processes or max_threads or 1)
     if labeler not in ("scipy", "cc3d"):
         raise ValueError(f"labeler must be 'scipy' or 'cc3d', got {labeler!r}")
     if labeler == "cc3d":
@@ -864,7 +864,7 @@ def label_array(
     shape = tuple(int(s) for s in mask.shape)
     ndim = len(shape)
     if tile_shape is None:
-        # Derive it from the mask: a ~64 MiB working set, grown in whole storage chunks
+        # Derive it from the mask: a ~256 MiB working set (_DEFAULT_TILE_MIB), grown in whole storage chunks
         # where the mask exposes them. See `default_tile_shape`.
         _chunks = getattr(mask, "chunks", None)
         if backend == "dask" and _chunks is not None:
@@ -892,10 +892,10 @@ def label_array(
     # Runs the module-level `_meta_worker` (picklable) over a thread OR process pool; the
     # invariant context goes to each worker once via the initializer. Progress is printed in
     # the PARENT as results arrive (a worker process can't update the parent's counter). ---
-    use_process = executor == "process" and n_workers > 1
+    use_process = max_processes is not None and n_pool > 1
     if use_process and isinstance(mask, np.ndarray):
         use_process = False   # an in-memory array would be COPIED into every worker
-    if use_process and n_tiles < 2 * n_workers:
+    if use_process and n_tiles < 2 * n_pool:
         use_process = False   # too few tiles to amortize process start-up
 
     init_args = (mask, struct, shape, grid_shape, connectivity, properties, labeler)
@@ -903,10 +903,10 @@ def label_array(
     t0 = time.perf_counter()
     if verbose:
         print(f"Phase A: computing metadata for {n_tiles} tiles (grid_shape={grid_shape}) "
-              f"[{'process' if use_process else 'thread'} pool x{n_workers}, labeler={labeler}]...")
-    if n_workers > 1:
+              f"[{'process' if use_process else 'thread'} pool x{n_pool}, labeler={labeler}]...")
+    if n_pool > 1:
         Pool = ProcessPoolExecutor if use_process else ThreadPoolExecutor
-        with Pool(max_workers=n_workers, initializer=_init_worker, initargs=init_args) as ex:
+        with Pool(max_workers=n_pool, initializer=_init_worker, initargs=init_args) as ex:
             results_iter = ex.map(_meta_worker, tiles)
             tile_results = []
             for result in results_iter:

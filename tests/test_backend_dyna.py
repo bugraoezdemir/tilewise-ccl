@@ -59,7 +59,7 @@ def test_matches_scipy(tmp_path, blobs, connectivity):
     expected, _ = ndi.label(blobs > 128,
                             structure=ndi.generate_binary_structure(3, connectivity))
     labels = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                         connectivity=connectivity, n_workers=2)
+                         connectivity=connectivity, max_threads=2)
     assert _partition(_materialize(labels)) == _partition(expected)
 
 
@@ -74,9 +74,9 @@ def test_dyna_equals_dask(tmp_path, blobs):
     """Same input, both backends -> byte-identical output, not merely equivalent."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     dyna = _materialize(label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                                    connectivity=2, n_workers=2, backend="dyna"))
+                                    connectivity=2, max_threads=2, backend="dyna"))
     dask = _materialize(label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                                    connectivity=2, n_workers=2, backend="dask"))
+                                    connectivity=2, max_threads=2, backend="dask"))
     np.testing.assert_array_equal(dyna, dask)
 
 
@@ -86,14 +86,14 @@ def test_tile_shape_invariance(tmp_path, blobs, tile_shape):
     path = _write(tmp_path, blobs, (16, 16, 16))
     expected, _ = ndi.label(blobs > 128, structure=ndi.generate_binary_structure(3, 2))
     labels = label_array(io.read(path) > 128, tile_shape=tile_shape,
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     assert _partition(_materialize(labels)) == _partition(expected)
 
 
 def test_labels_are_dense(tmp_path, blobs):
     path = _write(tmp_path, blobs, (16, 16, 16))
     out = _materialize(label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                                   connectivity=2, n_workers=2))
+                                   connectivity=2, max_threads=2))
     ids = np.unique(out)
     ids = ids[ids > 0]
     assert ids.min() == 1 and ids.max() == ids.size
@@ -103,7 +103,7 @@ def test_default_tile_shape(tmp_path, blobs):
     """`tile_shape=None` derives one from the mask, including its chunking."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     expected, _ = ndi.label(blobs > 128, structure=ndi.generate_binary_structure(3, 2))
-    labels = label_array(io.read(path) > 128, connectivity=2, n_workers=2)
+    labels = label_array(io.read(path) > 128, connectivity=2, max_threads=2)
     assert _partition(_materialize(labels)) == _partition(expected)
 
 
@@ -111,7 +111,7 @@ def test_properties_match_scipy(tmp_path, blobs):
     """`properties=True` areas/bboxes are metadata - they must still be right."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels, diag = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                               connectivity=2, n_workers=2, properties=True)
+                               connectivity=2, max_threads=2, properties=True)
     out = _materialize(labels)
     for lbl, area in zip(diag["label_values"], diag["area"]):
         assert int((out == lbl).sum()) == int(area)
@@ -128,7 +128,7 @@ def test_bbox_crop_reads_only_the_box(tmp_path, blobs):
     """The README workflow: locate an object from metadata, then read just its bbox."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels, diag = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                               connectivity=2, n_workers=2, properties=True)
+                               connectivity=2, max_threads=2, properties=True)
     i = int(np.argmax(diag["area"]))
     lbl = int(diag["label_values"][i])
     lo, hi = diag["bbox_start"][i], diag["bbox_stop"][i]
@@ -146,9 +146,9 @@ def test_write_round_trip(tmp_path, blobs):
     """
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels = label_array(io.read(path) > 128, tile_shape=(32, 32, 32),
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     out = tmp_path / "labels.zarr"
-    io.write(labels, str(out), chunks=(16, 16, 16), max_workers=2, overwrite=True)
+    io.write(labels, str(out), chunks=(16, 16, 16), max_threads=2, overwrite=True)
 
     expected, _ = ndi.label(blobs > 128, structure=ndi.generate_binary_structure(3, 2))
     assert _partition(zarr.open_array(str(out), mode="r")[...]) == _partition(expected)
@@ -167,7 +167,7 @@ def test_2d_volume(tmp_path):
     path = _write(tmp_path, img, (16, 16))
     expected, _ = ndi.label(img > 128, structure=ndi.generate_binary_structure(2, 2))
     labels = label_array(io.read(path) > 128, tile_shape=(16, 16),
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     assert _partition(_materialize(labels)) == _partition(expected)
 
 
@@ -183,7 +183,7 @@ def test_integer_index_plane(tmp_path, blobs, connectivity):
     """
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                         connectivity=connectivity, n_workers=2)
+                         connectivity=connectivity, max_threads=2)
     full = _materialize(labels)
     # tile boundaries, interiors, both ends, and a negative index
     for z in (0, 1, 15, 16, 17, 32, 63, -1, -17):
@@ -195,7 +195,7 @@ def test_integer_index_other_axes(tmp_path, blobs):
     """Integer indexing on a trailing axis, and on several axes at once."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     full = _materialize(labels)
     for key in [(slice(None), 20, slice(None)),
                 (slice(None), slice(None), 33),
@@ -209,7 +209,7 @@ def test_windowed_plane(tmp_path, blobs):
     """A sub-window of a plane - the viewer's frame-size knob - stays correct."""
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels = label_array(io.read(path) > 128, tile_shape=(16, 16, 16),
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     full = _materialize(labels)
     np.testing.assert_array_equal(_materialize(labels[32, 8:56, 8:56]), full[32, 8:56, 8:56])
 
@@ -231,13 +231,13 @@ def test_write_sliced_round_trip(tmp_path, blobs, sl):
     """
     path = _write(tmp_path, blobs, (16, 16, 16))
     labels = label_array(io.read(path) > 128, tile_shape=(32, 32, 32),
-                         connectivity=2, n_workers=2)
+                         connectivity=2, max_threads=2)
     expected = _materialize(labels[sl])
 
     out = tmp_path / "sliced.zarr"
     sub = labels[sl]
     chunks = tuple(min(16, s) for s in sub.shape)
-    io.write(sub, str(out), chunks=chunks, max_workers=2, overwrite=True)
+    io.write(sub, str(out), chunks=chunks, max_threads=2, overwrite=True)
     got = zarr.open_array(str(out), mode="r")[...]
 
     assert got.shape == expected.shape

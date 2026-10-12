@@ -4,8 +4,8 @@
 and assert an exact label-to-label bijection against a direct
 `scipy.ndimage.label` reference on the same (tile-free) array - the same
 strict ground-truth check, plus a check that the
-diagnostic object count matches. Both the sequential (n_workers=1) and
-threaded (n_workers>1) Phase-A paths are exercised, and 2D + 3D to confirm the
+diagnostic object count matches. Both the sequential (max_threads=1) and
+threaded (max_threads>1) Phase-A paths are exercised, and 2D + 3D to confirm the
 N-D generality.
 """
 
@@ -62,10 +62,10 @@ def test_label_array_3d_seq_and_parallel() -> None:
     ref, n_ref = ndi.label(data, structure=struct)
     assert n_ref == 5
 
-    out_seq, diag_seq = label_array(data, tile_shape=(4, 4, 4), connectivity=2, n_workers=1, diagnostics=True)
+    out_seq, diag_seq = label_array(data, tile_shape=(4, 4, 4), connectivity=2, max_threads=1, diagnostics=True)
     _check_bijection(ref, out_seq.compute(), n_ref, diag_seq)
 
-    out_par, diag_par = label_array(data, tile_shape=(4, 4, 4), connectivity=2, n_workers=4, diagnostics=True)
+    out_par, diag_par = label_array(data, tile_shape=(4, 4, 4), connectivity=2, max_threads=4, diagnostics=True)
     par_result = out_par.compute()
     _check_bijection(ref, par_result, n_ref, diag_par)
 
@@ -81,7 +81,7 @@ def test_label_array_2d() -> None:
     ref, n_ref = ndi.label(data, structure=struct)
     assert n_ref == 3
 
-    out, diag = label_array(data, tile_shape=(8, 8), connectivity=2, n_workers=2, diagnostics=True)
+    out, diag = label_array(data, tile_shape=(8, 8), connectivity=2, max_threads=2, diagnostics=True)
     _check_bijection(ref, out.compute(), n_ref, diag)
 
 
