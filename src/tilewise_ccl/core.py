@@ -37,6 +37,7 @@ removed in 0.0.5; it was kept only for benchmarking and had no users.
 from __future__ import annotations
 
 import itertools
+import multiprocessing
 import time
 import warnings
 from collections import defaultdict
@@ -905,8 +906,18 @@ def label_array(
         print(f"Phase A: computing metadata for {n_tiles} tiles (grid_shape={grid_shape}) "
               f"[{'process' if use_process else 'thread'} pool x{n_pool}, labeler={labeler}]...")
     if n_pool > 1:
-        Pool = ProcessPoolExecutor if use_process else ThreadPoolExecutor
-        with Pool(max_workers=n_pool, initializer=_init_worker, initargs=init_args) as ex:
+        if use_process:
+            # "spawn" on every OS. Linux's default "fork" (up to Python 3.13) copies a
+            # process whose other threads (dask, TensorStore, earlier pools) may hold
+            # locks, and the children then hang: the 0.0.7 CI froze on Linux this way
+            # while Windows and macOS, which spawn, passed.
+            pool = ProcessPoolExecutor(max_workers=n_pool,
+                                       mp_context=multiprocessing.get_context("spawn"),
+                                       initializer=_init_worker, initargs=init_args)
+        else:
+            pool = ThreadPoolExecutor(max_workers=n_pool, initializer=_init_worker,
+                                      initargs=init_args)
+        with pool as ex:
             results_iter = ex.map(_meta_worker, tiles)
             tile_results = []
             for result in results_iter:
