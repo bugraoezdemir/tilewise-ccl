@@ -242,3 +242,23 @@ def test_write_sliced_round_trip(tmp_path, blobs, sl):
 
     assert got.shape == expected.shape
     np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("connectivity", [1, 3])
+def test_phase_b_with_and_without_dyna_label_tiles(tmp_path, blobs, monkeypatch,
+                                                   connectivity):
+    """dyna-zarr with ``operations.label_tiles`` runs Phase B there (its native engine
+    reads it); an older dyna-zarr keeps the map_overlap path. Identical labels."""
+    from dyna_zarr import operations as dops
+    if not hasattr(dops, "label_tiles"):
+        pytest.skip("this dyna-zarr has no label_tiles")
+    path = _write(tmp_path, blobs, (16, 16, 16))
+    own = label_array(io.read(path) > 128, tile_shape=(24, 32, 20),
+                      connectivity=connectivity, backend="dyna")
+    assert own._transform.kernel["name"] == "label_tiles"
+    with_it = _materialize(own)
+    monkeypatch.delattr(dops, "label_tiles")
+    old = label_array(io.read(path) > 128, tile_shape=(24, 32, 20),
+                      connectivity=connectivity, backend="dyna")
+    assert old._transform.kernel is None
+    np.testing.assert_array_equal(with_it, _materialize(old))
