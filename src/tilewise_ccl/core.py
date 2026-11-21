@@ -1097,6 +1097,15 @@ def label_array(
                                 out_dtype=out_dtype, mask=mask)
 
         from dyna_zarr import operations as _dops
+        if hasattr(_dops, "label_tiles"):
+            # dyna-zarr's own Phase B (Workplan DR7 step 8): the same per-tile labeling
+            # and tables, which dyna's native engine reads without Python per tile.
+            # cc3d and scipy give identical local ids, so `labeler` does not matter here.
+            return _finalize(_dops.label_tiles(mask, full_luts,
+                                               tuple(int(t) for t in tile_shape),
+                                               connectivity, out_dtype),
+                             diag, diagnostics, properties, t0)
+        # an older dyna-zarr: Phase B as a map_overlap with our own block function.
         # align=tile_shape: every pulled region is expanded to WHOLE tiles, so Phase B is
         # correct for any write region size / chunking (a sub-tile region just re-reads its
         # tile). `io.write` picks this alignment up automatically as its region size, so
